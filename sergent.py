@@ -32,7 +32,7 @@ except ImportError:
     print("Il manque des librairies. Lance :  pip install -r requirements.txt")
     sys.exit(1)
 
-VERSION = "1.3"
+VERSION = "1.4"
 ORANGE = "#FF5F1F"
 ICI = pathlib.Path(__file__).resolve().parent
 WINDOWS = platform.system() == "Windows"
@@ -52,7 +52,13 @@ CONFIG_DEFAUT = {
     "minutes_confiance": 15,
     "rea_commande": "",        # vide = trouve « rea » tout seul (npm install -g rea-agents)
     "rea_timeout": 900,        # secondes max par analyse REA (Ghidra peut être long)
+    "verifier_maj": True,      # regarde au démarrage s'il y a une nouvelle version
+    "depot_maj": "alexmarceauprevost812-source/sergent",   # dépôt GitHub des mises à jour
+    "branche_maj": "main",
 }
+
+# Fichiers remplacés par /maj (config.json n'est JAMAIS touché : tes réglages restent)
+FICHIERS_MAJ = ("sergent.py", "requirements.txt", "LISEZMOI.md", "installer.cmd", "installer.ps1")
 
 # Commandes REA qui ne font que LIRE (analyse statique) : pas besoin de demander.
 # Tout le reste (capture, instrumentation, ADB qui écrit, extraction, setup…) demande à Alex.
@@ -764,7 +770,8 @@ AIDE = """[bold]Commandes[/]
   /dossier [chemin]  voir ou changer le dossier de travail
   /modele [nom]      voir ou changer le modèle Ollama
   /confiance [min]   lancer les commandes sensibles sans redemander (15 min par défaut)
-  /quitter           sortir (ou Ctrl+D)
+  /maj               chercher et installer la dernière version de Sergent
+  /quitter          sortir (ou Ctrl+D)
   !commande          lancer une commande toi-même (ex. !python app.py)
 Ctrl+C pendant une mission = l'arrêter.  Tout le reste = une mission pour Sergent."""
 
@@ -782,15 +789,141 @@ def verifier_ollama(cfg):
         console.print("[yellow]Change-le avec /modele NOM ou dans config.json.[/]")
 
 
+# ───────────────────────────── MISES À JOUR ─────────────────────────────
+
+def _version_tuple(v: str):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))) or (0,)
+
+
+def _url_brut(cfg, fichier: str) -> str:
+    return (f"https://raw.githubusercontent.com/{cfg.get('depot_maj') or CONFIG_DEFAUT['depot_maj']}/"
+            f"{cfg.get('branche_maj') or 'main'}/{fichier}")
+
+
+def version_distante(cfg, timeout=5):
+    """Lit VERSION dans le sergent.py publié sur GitHub. Retourne (version, octets du fichier)."""
+    r = requests.get(_url_brut(cfg, "sergent.py"), headers=UA, timeout=timeout)
+    r.raise_for_status()
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', r.text, re.M)
+    if not m:
+        raise ValueError("pas de VERSION dans le sergent.py publié")
+    return m.group(1), r.content
+
+
+def annoncer_maj(cfg):
+    """Au démarrage : petit message s'il y a mieux. Silencieux si pas d'internet."""
+    if not cfg.get("verifier_maj", True):
+        return
+    try:
+        v, _ = version_distante(cfg, timeout=3)
+    except Exception:
+        return
+    if _version_tuple(v) > _version_tuple(VERSION):
+        console.print(f"[{ORANGE}]⬆ Mise à jour disponible : v{VERSION} → v{v}. Tape /maj pour l'installer.[/]\n")
+
+
+def _git(*args, timeout=60):
+    return subprocess.run(["git", "-C", str(ICI), *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
+
+
+def _pip_requirements():
+    req = ICI / "requirements.txt"
+    if req.exists():
+        console.print("[grey50]Mise à jour des librairies Python…[/]")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "-r", str(req)])
+
+
+def mettre_a_jour(cfg) -> bool:
+    """Installe la dernière version. Retourne True si Sergent a changé (il faut le relancer)."""
+    # 1) Dossier cloné avec git : git pull (garde l'historique, refuse si tu as des changements à toi)
+    if (ICI / ".git").exists() and shutil.which("git"):
+        try:
+            if _git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+                console.print("[yellow]Tu as des changements pas encore commités dans "
+                              f"{ICI}. Commite-les (ou annule-les) avant /maj.[/]")
+                return False
+            avant = _git("rev-parse", "HEAD").stdout.strip()
+            with console.status(f"[{ORANGE}]Recherche de mises à jour (git)…[/]", spinner="dots"):
+                r = _git("pull", "--ff-only", timeout=120)
+        except subprocess.TimeoutExpired:
+            console.print("[red]git a pris trop de temps. Vérifie ta connexion.[/]")
+            return False
+        if r.returncode != 0:
+            console.print(f"[red]git pull a échoué :[/]\n{(r.stderr or r.stdout).strip()}")
+            return False
+        apres = _git("rev-parse", "HEAD").stdout.strip()
+        if avant == apres:
+            console.print(f"[{ORANGE}]Sergent est déjà à jour (v{VERSION}).[/]")
+            return False
+        console.print(_git("log", "--oneline", f"{avant}..{apres}").stdout.strip())
+        if "requirements.txt" in _git("diff", "--name-only", avant, apres).stdout:
+            _pip_requirements()
+        console.print(f"[{ORANGE}]✔ Sergent est à jour. Relance-le pour utiliser la nouvelle version.[/]")
+        return True
+
+    # 2) Installé depuis un ZIP : on télécharge les fichiers depuis GitHub
+    try:
+        with console.status(f"[{ORANGE}]Recherche de mises à jour…[/]", spinner="dots"):
+            v, code = version_distante(cfg, timeout=15)
+    except Exception as e:
+        console.print(f"[red]Impossible de joindre GitHub : {e}[/]")
+        return False
+    if _version_tuple(v) <= _version_tuple(VERSION):
+        console.print(f"[{ORANGE}]Sergent est déjà à jour (v{VERSION}).[/]")
+        return False
+    try:
+        rep = console.input(f"[yellow]Installer la v{v} (tu as la v{VERSION})? (o/n) › [/]").strip().lower()
+    except EOFError:
+        rep = ""
+    if rep not in ("o", "oui", "y", "yes"):
+        return False
+    try:
+        compile(code.decode("utf-8"), "sergent.py", "exec")   # on n'installe jamais un fichier cassé
+    except (SyntaxError, UnicodeDecodeError) as e:
+        console.print(f"[red]La version publiée est invalide ({e}). Rien n'a été changé.[/]")
+        return False
+    nouveaux = {"sergent.py": code}
+    for f in FICHIERS_MAJ:
+        if f in nouveaux:
+            continue
+        try:
+            r = requests.get(_url_brut(cfg, f), headers=UA, timeout=15)
+            if r.status_code == 200:
+                nouveaux[f] = r.content
+        except requests.RequestException:
+            pass
+    sauvegarde = ICI / "ancienne-version" / f"v{VERSION}"
+    sauvegarde.mkdir(parents=True, exist_ok=True)
+    for f in nouveaux:
+        if (ICI / f).exists():
+            shutil.copy2(ICI / f, sauvegarde / f)
+    req_avant = (ICI / "requirements.txt").read_bytes() if (ICI / "requirements.txt").exists() else b""
+    for f, contenu in nouveaux.items():
+        tmp = ICI / (f + ".nouveau")
+        tmp.write_bytes(contenu)
+        os.replace(tmp, ICI / f)
+    if nouveaux.get("requirements.txt", req_avant) != req_avant:
+        _pip_requirements()
+    console.print(f"[{ORANGE}]✔ Sergent v{v} installé ({', '.join(nouveaux)}). "
+                  f"Ancienne version gardée dans {sauvegarde}. Relance Sergent.[/]")
+    return True
+
+
 def main():
     cfg = charger_config()
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        print('Usage : sergent            (mode interactif)\n        sergent "mission"  (lance une mission tout de suite)')
+        print('Usage : sergent            (mode interactif)\n        sergent "mission"  (lance une mission tout de suite)'
+              '\n        sergent --maj      (installe la dernière version)')
+        return
+    if len(sys.argv) > 1 and sys.argv[1] in ("--maj", "/maj"):
+        mettre_a_jour(cfg)
         return
     console.print(Text(LOGO, style=f"bold {ORANGE}"))
     agent = Agent(cfg)
     console.print(f"[grey50] v{VERSION} · modèle [/][{ORANGE}]{cfg['modele']}[/][grey50] · dossier "
                   f"{agent.outils.dossier} · /aide[/]\n")
+    annoncer_maj(cfg)
     verifier_ollama(cfg)
 
     premiere = " ".join(sys.argv[1:]).strip()
@@ -816,6 +949,10 @@ def main():
             continue
         if cmd == "/aide":
             console.print(AIDE)
+            continue
+        if cmd == "/maj":
+            if mettre_a_jour(cfg):
+                break
             continue
         if cmd == "/nouveau":
             agent.nouveau()

@@ -22,7 +22,22 @@ Dans Sergent :
 - `/dossier C:\projets\mon-jeu` : travailler dans un autre dossier
 - `/modele caporal` : changer de cerveau
 - `/confiance 15` : les commandes sensibles passent sans demander pendant 15 min
+- `/maj` : installer la dernière version de Sergent
 - `Ctrl+C` : arrêter la mission en cours
+
+## Mises à jour
+Au démarrage, Sergent regarde sur GitHub (`alexmarceauprevost812-source/sergent`) s'il existe une
+version plus récente et te le dit. Tape `/maj` dans Sergent, ou `sergent --maj` dans un terminal.
+- Dossier cloné avec git : fait un `git pull` (refuse si tu as des changements pas commités).
+- Dossier installé depuis le ZIP : télécharge les nouveaux fichiers, garde l'ancienne version
+  dans `ancienne-version\`, et ne touche **jamais** à ton `config.json`.
+Pour ne plus vérifier au démarrage : `"verifier_maj": false` dans `config.json`.
+
+## Rétro-ingénierie (REA)
+Si le moteur REA est installé (`npm install -g rea-agents`), Sergent peut s'en servir pour analyser
+des programmes déjà installés (.exe, .dll, apps Electron, APK…). Les analyses en lecture seule
+passent toutes seules ; tout ce qui lance, capture ou modifie quelque chose te demande d'abord.
+Les résultats complets sont sauvés dans `rea-resultats\`.
 
 ## Sécurité
 - Par défaut, elle travaille seulement dans `%USERPROFILE%\sergent-projets`.

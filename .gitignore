@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.avant-rea
 rea-resultats/
+ancienne-version/
+*.nouveau
