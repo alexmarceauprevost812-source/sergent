@@ -1,0 +1,11 @@
+{
+  "ollama_url": "http://localhost:11434",
+  "modele": "coder30",
+  "num_ctx": 16384,
+  "temperature": 0.2,
+  "max_etapes": 40,
+  "timeout_commande": 120,
+  "dossier_travail": "",
+  "acces_tout_le_pc": false,
+  "minutes_confiance": 15
+}

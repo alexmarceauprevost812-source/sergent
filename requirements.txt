@@ -1,0 +1,4 @@
+requests
+rich
+ddgs
+beautifulsoup4
