@@ -23,6 +23,10 @@ Dans Sergent :
 - `/modele caporal` : changer de cerveau
 - `/confiance 15` : les commandes sensibles passent sans demander pendant 15 min
 - `/maj` : installer la dernière version de Sergent
+- `/panneau` : ouvrir le panneau en direct dans le navigateur
+- `/rea inspect-pe-imports "C:\chemin\app.exe"` : lancer REA directement (`/rea` seul = la liste des commandes)
+- `/github` : voir ton compte GitHub et tes dépôts
+- `/publier mon message` : envoyer les changements de Sergent lui-même sur ton GitHub
 - `Ctrl+C` : arrêter la mission en cours
 
 ## Mises à jour
@@ -38,6 +42,25 @@ Si le moteur REA est installé (`npm install -g rea-agents`), Sergent peut s'en 
 des programmes déjà installés (.exe, .dll, apps Electron, APK…). Les analyses en lecture seule
 passent toutes seules ; tout ce qui lance, capture ou modifie quelque chose te demande d'abord.
 Les résultats complets sont sauvés dans `rea-resultats\`.
+
+## Panneau en direct
+Tape `/panneau` : une page s'ouvre dans ton navigateur (seulement sur ton PC, `http://127.0.0.1:8765/`).
+- Chaque étape (commande, fichier écrit, correction, résultat) est un **panneau fermé** : clique pour l'ouvrir.
+- « Sergent écrit… » montre le texte et le code **pendant** que le modèle l'écrit.
+- Le texte de Sergent est en bleu ciel, le code est coloré comme dans VS Code (thème Dark+).
+  Les couleurs du panneau viennent d'internet (highlight.js) ; sans internet, le code reste lisible en blanc.
+- Une correction montre l'**avant** (rouge) et l'**après** (vert).
+Pour l'ouvrir tout seul au démarrage : `"panneau_auto": true` dans `config.json`.
+
+## GitHub
+Sergent utilise le GitHub CLI (`gh`, connecté avec `gh auth login`). Il peut :
+publier un projet (nouveau dépôt **privé** par défaut), lister et cloner tes dépôts,
+lire/créer des issues, ouvrir des pull requests. Il te demande **toujours** avant d'envoyer quelque chose.
+Il n'envoie jamais `.env`, clés `.pem`/`.key`, etc. : ils sont ajoutés au `.gitignore`.
+
+## Animation
+Au démarrage, SERGENT tombe du ciel lettre par lettre (Ctrl+C pour passer).
+Pour l'enlever : `"animation": false` dans `config.json`.
 
 ## Sécurité
 - Par défaut, elle travaille seulement dans `%USERPROFILE%\sergent-projets`.
