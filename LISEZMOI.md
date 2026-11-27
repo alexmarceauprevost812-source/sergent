@@ -19,6 +19,8 @@ sergent "fais-moi un jeu de serpent en Python"   (mission directe)
 Dans Sergent :
 - `/aide` : les commandes
 - `/nouveau` : nouvelle conversation
+- `/reprendre` : recharger la dernière conversation (même après avoir fermé Sergent ou s'il a planté)
+- `/code` : la liste du code replié · `/code 3` : ouvrir le bloc n° 3 au complet, en couleurs
 - `/dossier C:\projets\mon-jeu` : travailler dans un autre dossier
 - `/modele caporal` : changer de cerveau
 - `/confiance 15` : les commandes sensibles passent sans demander pendant 15 min
@@ -75,3 +77,14 @@ Pour l'enlever : `"animation": false` dans `config.json`.
 | `num_ctx` | mémoire de travail du modèle (16384 ; baisse à 8192 si c'est trop lent) |
 | `max_etapes` | nombre max d'actions par mission |
 | `timeout_commande` | secondes max par commande |
+| `reprises_tokens` | coupé par la limite de tokens : il continue où il était rendu (6 fois max) |
+| `essais_ollama` | Ollama en pause ou qui décroche : il attend et réessaie (8 fois max) |
+| `code_replie` | `true` = le code écrit s'affiche replié dans le terminal (`/code N` pour l'ouvrir) |
+
+## Moteur de reprise (v1.6)
+- **Limite de tokens** : si la réponse est coupée (gros fichier), Sergent lui demande de continuer exactement
+  où elle était rendue et recolle les morceaux (sans les répétitions).
+- **Pause d'Ollama** (modèle qui se charge, serveur occupé, connexion coupée) : il attend 2 s, 4 s, 8 s… (max 60 s)
+  et reprend **sans perdre** ce qui était déjà écrit.
+- **Plantage ou terminal fermé** : la conversation est sauvegardée après chaque étape. Relance `sergent`,
+  tape `/reprendre`, puis `continue`.

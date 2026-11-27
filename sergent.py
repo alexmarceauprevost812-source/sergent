@@ -37,7 +37,7 @@ except ImportError:
     print("Il manque des librairies. Lance :  pip install -r requirements.txt")
     sys.exit(1)
 
-VERSION = "1.5"
+VERSION = "1.6"
 ORANGE = "#FF5F1F"
 ICI = pathlib.Path(__file__).resolve().parent
 WINDOWS = platform.system() == "Windows"
@@ -89,7 +89,13 @@ CONFIG_DEFAUT = {
     "port_panneau": 8765,      # panneau web en direct : http://127.0.0.1:8765/
     "panneau_auto": False,     # true = ouvre le panneau dans le navigateur au démarrage
     "animation": True,         # SERGENT tombe du ciel au démarrage (false = logo direct)
+    "reprises_tokens": 6,      # coupé par la limite de tokens : il continue jusqu'à 6 fois
+    "essais_ollama": 8,        # Ollama en pause / qui décroche : il attend et réessaie jusqu'à 8 fois
+    "code_replie": True,       # le code écrit s'affiche replié dans le terminal (/code N pour l'ouvrir)
 }
+
+# Conversation sauvegardée après chaque étape : /reprendre la recharge même après une fermeture
+SESSION = pathlib.Path.home() / ".sergent-terminal" / "session.json"
 
 # Fichiers qu'on ne publie jamais sur GitHub (mots de passe, clés…)
 SECRETS = re.compile(r"(^|[\\/])(\.env(\..+)?|id_rsa.*|id_ed25519.*|.+\.pem|.+\.key|.+\.pfx|.+\.p12|"
@@ -148,6 +154,88 @@ def couper(texte: str, maxi: int = 6000) -> str:
         return texte
     m = maxi // 2
     return texte[:m] + f"\n\n[... {len(texte) - maxi} caractères coupés ...]\n\n" + texte[-m:]
+
+
+# ───────────────────────────── MOTEUR DE REPRISE ─────────────────────────────
+
+PROMPT_SUITE = ("Ta réponse a été coupée. Continue EXACTEMENT où tu t'es arrêté, au caractère près : "
+                "ne répète rien, n'explique rien, ne recommence pas le bloc.")
+
+
+class OllamaPassager(RuntimeError):
+    """Erreur qui vaut la peine d'attendre et de réessayer (modèle qui se charge, serveur occupé…)."""
+
+
+def erreur_passagere(e: BaseException) -> bool:
+    if isinstance(e, OllamaPassager):
+        return True
+    return isinstance(e, (requests.ConnectionError, requests.Timeout,
+                          requests.exceptions.ChunkedEncodingError, ConnectionError))
+
+
+def classer_erreur_ollama(code: int, texte: str) -> RuntimeError:
+    """5xx / « loading » / « busy » = passager (on réessaie) ; 404 ou modèle absent = permanent."""
+    bas = texte.lower()
+    if code in (408, 429, 500, 502, 503, 504) or any(m in bas for m in ("loading", "busy", "overloaded")):
+        return OllamaPassager(f"Ollama a répondu {code} : {texte[:200]}")
+    return RuntimeError(f"Ollama a répondu {code} : {texte[:300]}")
+
+
+def fusionner(avant: str, suite: str, maxi: int = 400) -> str:
+    """Colle la suite au texte déjà écrit, en enlevant ce que le modèle aurait répété au début."""
+    for n in range(min(maxi, len(avant), len(suite)), 7, -1):
+        if avant.endswith(suite[:n]):
+            debut_de_ligne = n == len(avant) or avant[-n - 1] == "\n"
+            if n >= 16 or debut_de_ligne:      # court : seulement si c'est une ligne entière répétée
+                return avant + suite[n:]
+    return avant + suite
+
+
+def attendre(secondes: float, message: str):
+    """Attente visible ; Ctrl+C l'interrompt comme une mission."""
+    with console.status(f"[yellow]{message}[/]", spinner="dots") as st:
+        fin = time.time() + secondes
+        while time.time() < fin:
+            st.update(f"[yellow]{message} ({fin - time.time():.0f} s)[/]")
+            time.sleep(0.25)
+
+
+# ───────────────────────────── CODE REPLIÉ ─────────────────────────────
+
+REPLIER = True                 # mis à jour depuis config.json au démarrage
+REPLIS: dict[int, tuple[str, str, str]] = {}   # numéro → (titre, texte, chemin pour les couleurs)
+_prochain_repli = 1
+
+
+def replier(titre: str, texte: str, chemin: str = "") -> int:
+    """Range un bloc de code : il s'affiche fermé, /code N l'ouvre."""
+    global _prochain_repli
+    n = _prochain_repli
+    _prochain_repli += 1
+    REPLIS[n] = (titre, texte, chemin)
+    for vieux in sorted(REPLIS)[:-40]:          # on garde les 40 derniers
+        del REPLIS[vieux]
+    return n
+
+
+def montrer_repli(arg: str):
+    if not REPLIS:
+        console.print("[grey50]Aucun code replié pour l'instant.[/]")
+        return
+    if not arg.strip().isdigit():
+        console.print(f"[{ORANGE}]Code replié (tape /code N pour ouvrir) :[/]")
+        for n in sorted(REPLIS)[-15:]:
+            titre, texte, _ = REPLIS[n]
+            console.print(f"  [{ORANGE}]{n:>3}[/]  {titre}  [grey50]· {len(texte.splitlines())} lignes[/]")
+        return
+    n = int(arg)
+    if n not in REPLIS:
+        console.print(f"[red]Pas de bloc n° {n}. Tape /code pour la liste.[/]")
+        return
+    titre, texte, chemin = REPLIS[n]
+    lexer = "diff" if chemin == "diff" else Syntax.guess_lexer(chemin or "x.txt", texte)
+    console.print(Panel(Syntax(texte, lexer, theme=THEME_CODE, line_numbers=True, background_color="default"),
+                        title=f"▾ {n} · {titre}", title_align="left", border_style=ORANGE))
 
 
 # ───────────────────────────── OUTILS ─────────────────────────────
@@ -739,6 +827,24 @@ ICONES = {"recherche_web": "🔎", "lire_page": "🌐", "lister": "📁", "lire_
 def afficher_appel(nom, args):
     if nom == "commande":
         corps = Syntax(str(args.get("cmd", "")), "powershell", theme=THEME_CODE, background_color="default")
+    elif nom == "ecrire_fichier" and args.get("contenu") is not None and REPLIER:
+        chemin = str(args.get("chemin", ""))
+        n = replier(f"✏️  {chemin}", args["contenu"], chemin)
+        return console.print(Panel(
+            Text.assemble(("▸ ", ORANGE), (f"{len(args['contenu'].splitlines())} lignes · code replié — ", "grey62"),
+                          (f"/code {n}", f"bold {ORANGE}"), (" pour l'ouvrir", "grey62")),
+            title=f"{ICONES[nom]} {nom} → {chemin}", title_align="left", border_style=ORANGE))
+    elif nom == "modifier_fichier" and REPLIER:
+        chemin = str(args.get("chemin", ""))
+        ancien = Outils._sans_numeros(str(args.get("ancien", ""))).split("\n")
+        nouveau = str(args.get("nouveau", "")).split("\n")
+        diff = "\n".join([f"- {l}" for l in ancien] + [f"+ {l}" for l in nouveau])
+        n = replier(f"🔧 {chemin}", diff, "diff")
+        return console.print(Panel(
+            Text.assemble(("▸ ", ORANGE), (f"−{len(ancien)} ", "red"), (f"+{len(nouveau)} lignes", "green"),
+                          (" · changement replié — ", "grey62"), (f"/code {n}", f"bold {ORANGE}"),
+                          (" pour l'ouvrir", "grey62")),
+            title=f"{ICONES[nom]} {nom} → {chemin}", title_align="left", border_style=ORANGE))
     elif nom == "ecrire_fichier" and args.get("contenu") is not None:
         code = args["contenu"]
         lignes = code.split("\n")
@@ -761,7 +867,15 @@ def afficher_appel(nom, args):
     console.print(Panel(corps, title=f"{ICONES.get(nom, '•')} {nom}", title_align="left", border_style=ORANGE))
 
 
-def afficher_resultat(texte, ok):
+def afficher_resultat(texte, ok, nom=""):
+    lignes = str(texte).splitlines()
+    if REPLIER and ok and len(lignes) > 8:       # long résultat (fichier lu, sortie de commande…) → replié
+        n = replier(f"{ICONES.get(nom, '✔')} résultat {nom}".rstrip(), str(texte))
+        apercu = "\n".join(l[:150] for l in lignes[:3])
+        return console.print(Panel(
+            Text.assemble((apercu + "\n", "grey70"), ("▸ ", ORANGE), (f"{len(lignes)} lignes · replié — ", "grey62"),
+                          (f"/code {n}", f"bold {ORANGE}"), (" pour tout voir", "grey62")),
+            title="✔ résultat", title_align="left", border_style="green"))
     console.print(Panel(Text(couper(texte, 1500), style="grey70"),
                         title="✔ résultat" if ok else "✘ erreur", title_align="left",
                         border_style="green" if ok else "red"))
@@ -836,7 +950,7 @@ pre.avant{border-left:3px solid var(--rouge)}pre.apres{border-left:3px solid var
 .etiq{font-size:12px;color:var(--gris);padding:6px 14px 0}
 </style></head><body>
 <header><h1 class="logo" aria-label="Sergent"><span>S</span><span>E</span><span>R</span><span>G</span><span>E</span><span>N</span><span>T</span></h1><span class="sous">en direct</span><span class="etat" id="etat"><b></b>déconnecté</span>
-<label><input type="checkbox" id="live" checked> ouvrir l'écriture en direct</label>
+<label><input type="checkbox" id="live"> ouvrir l'écriture en direct</label>
 <label><input type="checkbox" id="auto" checked> défiler tout seul</label>
 <button id="ouvrir">Tout ouvrir</button><button id="fermer">Tout fermer</button></header>
 <main id="flux"><p class="vide">En attente d'une mission… Tape-la dans le terminal de Sergent.</p></main>
@@ -1086,36 +1200,103 @@ class Agent:
         while total() > limite and len(self.messages) > 6:
             del self.messages[1]
 
-    def appeler_modele(self) -> str:
+    def _flux(self, messages, deja: str, debut: float):
+        """Un appel en streaming. Renvoie (texte reçu, raison de fin). Le texte reçu est gardé dans
+        self._recu même si la connexion casse en plein milieu (le moteur de reprise continue de là)."""
         url = self.cfg["ollama_url"].rstrip("/") + "/api/chat"
         corps = {
-            "model": self.cfg["modele"], "messages": self.messages, "stream": True, "keep_alive": "30m",
+            "model": self.cfg["modele"], "messages": messages, "stream": True, "keep_alive": "30m",
             "options": {"num_ctx": self.cfg["num_ctx"], "temperature": self.cfg["temperature"],
                         "stop": ["</outil>", "<resultat"]},
         }
-        texte, debut = "", time.time()
+        self._recu, raison = "", None
+        with console.status(f"[{ORANGE}]Sergent réfléchit…[/]", spinner="dots") as st:
+            with requests.post(url, json=corps, stream=True, timeout=(10, 1800)) as r:
+                if r.status_code != 200:
+                    raise classer_erreur_ollama(r.status_code, r.text)
+                for ligne in r.iter_lines():
+                    if not ligne:
+                        continue
+                    d = json.loads(ligne)
+                    if "error" in d:
+                        raise classer_erreur_ollama(500 if "load" in str(d["error"]).lower() else 0, str(d["error"]))
+                    morceau = d.get("message", {}).get("content", "")
+                    if morceau:
+                        self._recu += morceau
+                        self.panneau.emettre("jeton", texte=morceau)   # le panneau web voit l'écriture en direct
+                    st.update(f"[{ORANGE}]Sergent réfléchit… {len(deja) + len(self._recu)} caractères · "
+                              f"{time.time() - debut:.0f} s[/]")
+                    if d.get("done"):
+                        raison = d.get("done_reason") or "stop"
+                        break
+        if raison is None:                       # flux fermé sans « done » : connexion coupée en plein milieu
+            raise OllamaPassager("le flux s'est coupé en plein milieu")
+        return self._recu, raison
+
+    def appeler_modele(self) -> str:
+        """MOTEUR DE REPRISE :
+        - coupé par la limite de tokens → il continue où il était rendu (jusqu'à reprises_tokens fois);
+        - Ollama en pause / connexion coupée / modèle qui se charge → il attend (2 s, 4 s… 60 s) et reprend,
+          en gardant tout ce qui était déjà écrit;
+        - erreur permanente (modèle absent, 404) → pas de réessai, on la montre tout de suite."""
+        texte, debut, suites, echecs, delai = "", time.time(), 0, 0, 2.0
         self.panneau.emettre("debut_reponse")
         try:
-            with console.status(f"[{ORANGE}]Sergent réfléchit…[/]", spinner="dots") as st:
-                with requests.post(url, json=corps, stream=True, timeout=(10, 1800)) as r:
-                    if r.status_code != 200:
-                        raise RuntimeError(f"Ollama a répondu {r.status_code} : {r.text[:300]}")
-                    for ligne in r.iter_lines():
-                        if not ligne:
-                            continue
-                        d = json.loads(ligne)
-                        if "error" in d:
-                            raise RuntimeError(d["error"])
-                        morceau = d.get("message", {}).get("content", "")
-                        if morceau:
-                            texte += morceau
-                            self.panneau.emettre("jeton", texte=morceau)   # le panneau web voit l'écriture en direct
-                        st.update(f"[{ORANGE}]Sergent réfléchit… {len(texte)} caractères · {time.time() - debut:.0f} s[/]")
-                        if d.get("done"):
-                            break
+            while True:
+                messages = self.messages if not texte else [
+                    *self.messages, {"role": "assistant", "content": texte[-8000:]},
+                    {"role": "user", "content": PROMPT_SUITE}]
+                try:
+                    recu, raison = self._flux(messages, texte, debut)
+                except Exception as e:
+                    if not erreur_passagere(e):
+                        raise
+                    texte = fusionner(texte, getattr(self, "_recu", "")) if texte else getattr(self, "_recu", "")
+                    echecs += 1
+                    if echecs >= self.cfg.get("essais_ollama", 8):
+                        raise requests.ConnectionError(f"Ollama ne répond plus après {echecs} essais ({e})") from e
+                    msg = f"⏸ Pause : Ollama ne répond pas ({str(e)[:80]}). Je reprends où j'étais rendu"
+                    self.panneau.emettre("info", texte=msg + f" dans {delai:.0f} s…")
+                    attendre(delai, msg)
+                    delai = min(delai * 2, 60)
+                    continue
+                texte = fusionner(texte, recu) if texte else recu
+                if raison != "length":
+                    return texte
+                suites += 1
+                if suites > self.cfg.get("reprises_tokens", 6):
+                    console.print("[yellow]⚠ Encore coupé après plusieurs reprises : je garde ce qui est écrit.[/]")
+                    return texte
+                msg = f"⏸ Limite de tokens atteinte — je continue où j'étais rendu ({suites})…"
+                console.print(f"[yellow]{msg}[/]")
+                self.panneau.emettre("info", texte=msg)
         finally:
             self.panneau.emettre("fin_reponse")
-        return texte
+
+    def sauver_session(self):
+        """Écriture atomique de la conversation : /reprendre la recharge, même après une fermeture."""
+        try:
+            SESSION.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SESSION.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"dossier": str(self.outils.dossier), "modele": self.cfg["modele"],
+                                       "date": time.time(), "messages": self.messages[1:]},
+                                      ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, SESSION)
+        except OSError:
+            pass
+
+    def reprendre_session(self) -> bool:
+        try:
+            d = json.loads(SESSION.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not d.get("messages"):
+            return False
+        p = pathlib.Path(d.get("dossier") or self.outils.dossier)
+        if p.exists():
+            self.outils.dossier = p
+        self.messages = [{"role": "system", "content": self.prompt_systeme()}, *d["messages"]]
+        return True
 
     def executer(self, nom, args):
         table = {"recherche_web": self.outils.recherche_web, "lire_page": self.outils.lire_page,
@@ -1141,13 +1322,15 @@ class Agent:
         echecs, relances, derniers = 0, 0, []
         for etape in range(1, self.cfg["max_etapes"] + 1):
             self.compacter()
+            self.sauver_session()
             try:
                 brut = self.appeler_modele()
-            except requests.ConnectionError:
-                console.print("[red]Ollama ne répond pas. Ouvre l'application Ollama (ou tape : ollama serve).[/]")
+            except requests.ConnectionError as e:
+                console.print(f"[red]{e if 'essais' in str(e) else 'Ollama ne répond pas.'} Ouvre l'application "
+                              "Ollama (ou tape : ollama serve), puis tape « continue » : rien n'est perdu.[/]")
                 return
             except Exception as e:
-                console.print(f"[red]Erreur du modèle : {e}[/]")
+                console.print(f"[red]Erreur du modèle : {e}[/]\n[grey50]Tape « continue » pour reprendre.[/]")
                 return
 
             r = analyser(brut)
@@ -1187,7 +1370,7 @@ class Agent:
             afficher_appel(nom, args)
             self.panneau.emettre("outil", nom=nom, args=args)
             texte, ok = self.executer(nom, args)
-            afficher_resultat(texte, ok)
+            afficher_resultat(texte, ok, nom)
             self.panneau.emettre("resultat", ok=ok, texte=couper(str(texte), 20000))
 
             note = ""
@@ -1204,6 +1387,7 @@ class Agent:
             derniers = (derniers + [signature])[-6:]
             self.messages.append({"role": "user", "content":
                 f'<resultat outil="{nom}">\n{texte}\n</resultat>{note}'})
+            self.sauver_session()
 
         console.print(f"[yellow]Limite de {self.cfg['max_etapes']} étapes atteinte. "
                       "Tape « continue » pour qu'il poursuive.[/]")
@@ -1294,6 +1478,8 @@ def animer_logo(cfg):
 AIDE = r"""[bold]Commandes[/]
   /aide              cette aide
   /nouveau           nouvelle conversation (oublie tout)
+  /reprendre         recharger la dernière conversation (même après avoir fermé Sergent)
+  /code \[N]          voir la liste du code replié, ou ouvrir le bloc N
   /dossier \[chemin]  voir ou changer le dossier de travail
   /modele \[nom]      voir ou changer le modèle Ollama
   /confiance \[min]   lancer les commandes sensibles sans redemander (15 min par défaut)
@@ -1480,6 +1666,8 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--maj", "/maj"):
         mettre_a_jour(cfg)
         return
+    global REPLIER
+    REPLIER = bool(cfg.get("code_replie", True))
     animer_logo(cfg)
     panneau = Panneau(cfg.get("port_panneau", 8765))
     url_panneau = panneau.demarrer()
@@ -1491,6 +1679,9 @@ def main():
         webbrowser.open(url_panneau)
     annoncer_maj(cfg)
     verifier_ollama(cfg)
+    if SESSION.exists() and len(sys.argv) <= 1:
+        console.print(f"[grey50] Ta dernière conversation est sauvegardée : /reprendre pour continuer où tu "
+                      "étais rendu.[/]\n")
 
     premiere = " ".join(sys.argv[1:]).strip()
     while True:
@@ -1579,11 +1770,22 @@ def main():
                 console.print(f"[{ORANGE}]Mode confiance actif {minutes} min. "
                               "(Formater un disque, diskpart, git push --force : toujours demandé.)[/]")
             continue
+        if cmd == "/code":
+            montrer_repli(reste)
+            continue
+        if cmd == "/reprendre":
+            if agent.reprendre_session():
+                console.print(f"[{ORANGE}]▶ Conversation reprise ({len(agent.messages) - 1} messages, dossier "
+                              f"{agent.outils.dossier}). Tape « continue » pour qu'il reparte où il était rendu.[/]")
+            else:
+                console.print("[yellow]Aucune conversation sauvegardée à reprendre.[/]")
+            continue
         try:
             agent.mission(demande)
         except KeyboardInterrupt:
-            console.print("\n[yellow]Mission arrêtée.[/]")
+            console.print("\n[yellow]Mission arrêtée. Tape « continue » pour reprendre où il était rendu.[/]")
             agent.messages.append({"role": "user", "content": "(Alex a arrêté la mission.)"})
+        agent.sauver_session()
     console.print(f"[{ORANGE}]À la prochaine, Alex![/]")
 
 
